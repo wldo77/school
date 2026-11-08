@@ -1,6 +1,17 @@
+import base64
+import html
+import json
+import logging
+import re
+import secrets
 
 import streamlit as st
-import html
+import streamlit.components.v1 as components
+
+try:
+    from supabase import create_client
+except Exception:  # supabase 패키지가 없어도 앱이 완전히 멈추지 않도록 처리
+    create_client = None
 
 st.set_page_config(
     page_title="나의 과목 선택 가이드",
@@ -9,10 +20,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+logger = logging.getLogger("subject_guide")
+
 # =====================================================
 # 1. 과목 데이터
+# -----------------------------------------------------
+# 아래 FALLBACK_COURSES는 기존 앱의 과목 데이터 원본입니다.
+#  - Supabase `courses` 테이블에 처음 등록할 때의 자료로 사용합니다.
+#    (courses_seed.csv / supabase_setup.sql 의 과목 데이터와 같은 내용)
+#  - 데이터베이스에 연결하지 못했거나 과목이 아직 등록되지 않았을 때
+#    "읽기 전용 기본 화면"으로만 사용합니다. (관심 과목/후기 저장은 불가)
 # =====================================================
-COURSES = [
+FALLBACK_COURSES = [
     {"name": "공통국어", "field": "국어", "kind": "일반 선택",
      "intro": "다양한 글을 읽고 자신의 생각을 표현합니다.",
      "goals": "읽기, 쓰기, 말하기, 듣기 능력과 비판적 사고력을 기릅니다.",
@@ -144,9 +163,6 @@ COURSES = [
      "careers": ["체육", "보건", "교육"], "topics": ["건강", "프로젝트"]},
 ]
 
-FIELDS = list(dict.fromkeys(c["field"] for c in COURSES))
-COURSE_NAMES = [c["name"] for c in COURSES]
-
 FIELD_DESCRIPTIONS = {
     "국어": "읽기, 쓰기, 말하기와 문학을 탐구하는 분야",
     "수학": "논리적 사고와 수학적 문제 해결을 배우는 분야",
@@ -161,6 +177,188 @@ FIELD_DESCRIPTIONS = {
 }
 
 # =====================================================
+# 1-B. Supabase 연결과 데이터 불러오기
+# =====================================================
+COOKIE_NAME = "sg_visitor"          # 익명 방문자 식별 쿠키 이름
+COOKIE_DAYS = 180                   # 쿠키 보관 기간(일)
+TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+
+REVIEW_MAX = 1000                   # 후기 최대 글자 수 (DB 제약조건과 동일)
+ADVICE_MAX = 300                    # 조언 최대 글자 수 (DB 제약조건과 동일)
+REPORT_DETAIL_MAX = 300             # 신고 추가 설명 최대 글자 수
+REVIEW_LIST_LIMIT = 30              # 한 번에 보여줄 최대 후기 수
+
+CONNECTION_MESSAGES = {
+    "no_package": "supabase 패키지가 설치되지 않았어요. requirements.txt에 supabase가 들어 있는지 확인해 주세요.",
+    "no_secrets": "Streamlit Secrets에 SUPABASE_URL과 SUPABASE_KEY가 설정되지 않았어요.",
+    "no_url": "Streamlit Secrets에 SUPABASE_URL이 없어요.",
+    "no_key": "Streamlit Secrets에 SUPABASE_KEY가 없어요.",
+    "bad_url": "SUPABASE_URL 형식이 올바르지 않아요. https://프로젝트ID.supabase.co 형태인지 확인해 주세요.",
+    "forbidden_key": "비밀 키(service_role 또는 secret 키)는 이 앱에서 사용할 수 없어요. anon 또는 publishable 키로 바꿔 주세요.",
+    "connect_failed": "Supabase에 연결할 준비를 하지 못했어요. URL과 KEY 값이 올바른지 확인해 주세요.",
+}
+
+DB_ERROR_MESSAGES = {
+    "setup": "데이터베이스 테이블이나 함수가 아직 준비되지 않았어요. supabase_setup.sql을 실행했는지 확인해 주세요.",
+    "network": "네트워크 문제로 데이터베이스에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.",
+    "permission": "데이터베이스 접근 권한 설정(RLS) 때문에 요청이 거부되었어요. 정책 설정을 확인해 주세요.",
+    "auth": "Supabase 키가 올바르지 않거나 만료된 것 같아요. Secrets의 SUPABASE_KEY를 확인해 주세요.",
+    "unknown": "알 수 없는 문제로 데이터베이스 요청에 실패했어요. 잠시 후 다시 시도해 주세요.",
+    "offline": "데이터베이스에 연결되어 있지 않아요.",
+}
+
+
+def read_secret(name):
+    """Streamlit Secrets에서 값을 읽습니다. 없으면 None (값 자체는 화면에 출력하지 않음)."""
+    try:
+        value = st.secrets[name]
+    except Exception:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def key_is_forbidden(key):
+    """service_role / secret 키처럼 앱에서 쓰면 안 되는 키인지 검사합니다."""
+    if key.startswith("sb_secret_"):
+        return True
+    if key.count(".") == 2:
+        try:
+            payload = key.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload.encode()))
+            return data.get("role") == "service_role"
+        except Exception:
+            return False
+    return False
+
+
+@st.cache_resource(show_spinner=False)
+def connect_supabase(url, key):
+    return create_client(url, key)
+
+
+def get_supabase():
+    """(클라이언트, 오류코드)를 돌려줍니다. 성공하면 오류코드는 None."""
+    if create_client is None:
+        return None, "no_package"
+
+    url = read_secret("SUPABASE_URL")
+    key = read_secret("SUPABASE_KEY")
+    if not url and not key:
+        return None, "no_secrets"
+    if not url:
+        return None, "no_url"
+    if not key:
+        return None, "no_key"
+    if not url.startswith("https://"):
+        return None, "bad_url"
+    if key_is_forbidden(key):
+        return None, "forbidden_key"
+
+    try:
+        return connect_supabase(url, key), None
+    except Exception as exc:
+        logger.warning("Supabase 클라이언트 생성 실패: %s", type(exc).__name__)
+        return None, "connect_failed"
+
+
+def classify_db_error(exc):
+    """예외를 사용자에게 보여줄 수 있는 분류 이름으로 바꿉니다. (원문은 화면에 출력하지 않음)"""
+    code = str(getattr(exc, "code", "") or "")
+    text = f"{type(exc).__name__} {exc}".lower()
+    if code in ("PGRST205", "PGRST202", "42P01", "42883") or "could not find the" in text:
+        return "setup"
+    if code == "42501" or "permission denied" in text or "row-level security" in text:
+        return "permission"
+    if code == "PGRST301" or "invalid api key" in text or "jwt" in text:
+        return "auth"
+    if any(w in text for w in (
+        "connect", "timeout", "timed out", "network", "name or service",
+        "resolve", "ssl", "unreachable",
+    )):
+        return "network"
+    if "does not exist" in text:
+        return "setup"
+    return "unknown"
+
+
+def db_rpc(fn_name, params):
+    """Supabase RPC(데이터베이스 함수) 호출. (성공 여부, 결과 또는 오류분류)를 돌려줍니다."""
+    if SUPABASE is None:
+        return False, "offline"
+    try:
+        response = SUPABASE.rpc(fn_name, params).execute()
+        return True, response.data
+    except Exception as exc:
+        kind = classify_db_error(exc)
+        logger.warning(
+            "RPC %s 실패: %s (code=%s, kind=%s)",
+            fn_name, type(exc).__name__, getattr(exc, "code", None), kind,
+        )
+        return False, kind
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_courses(_client):
+    response = (
+        _client.table("courses")
+        .select("id,name,field,course_type,intro,goals,topics,careers")
+        .eq("is_active", True)
+        .execute()
+    )
+    return response.data or []
+
+
+def rows_to_courses(rows):
+    """DB 행(course_type)을 기존 앱에서 쓰던 딕셔너리(kind)로 바꿉니다."""
+    courses = []
+    for row in rows:
+        name = (row.get("name") or "").strip()
+        field = (row.get("field") or "").strip()
+        if not name or not field or not row.get("id"):
+            continue
+        courses.append({
+            "id": str(row["id"]),
+            "name": name,
+            "field": field,
+            "kind": row.get("course_type") or "일반 선택",
+            "intro": row.get("intro") or "",
+            "goals": row.get("goals") or "",
+            "careers": list(row.get("careers") or []),
+            "topics": list(row.get("topics") or []),
+        })
+    # 기존 앱의 표시 순서를 유지합니다. (DB에만 있는 새 과목은 뒤쪽에 이름순)
+    order = {c["name"]: i for i, c in enumerate(FALLBACK_COURSES)}
+    courses.sort(key=lambda c: (order.get(c["name"], len(order)), c["name"]))
+    return courses
+
+
+def load_courses():
+    """(과목 목록, 상태, 상세) 반환. 상태: ok / offline / error / empty"""
+    offline_courses = [dict(c, id=None) for c in FALLBACK_COURSES]
+    if SUPABASE is None:
+        return offline_courses, "offline", SUPABASE_ERROR
+    try:
+        rows = fetch_courses(SUPABASE)
+    except Exception as exc:
+        kind = classify_db_error(exc)
+        logger.warning("과목 조회 실패: %s (kind=%s)", type(exc).__name__, kind)
+        return offline_courses, "error", kind
+    courses = rows_to_courses(rows)
+    if not courses:
+        return offline_courses, "empty", None
+    return courses, "ok", None
+
+
+SUPABASE, SUPABASE_ERROR = get_supabase()
+COURSES, COURSE_STATUS, COURSE_STATUS_DETAIL = load_courses()
+DB_READY = COURSE_STATUS == "ok"
+
+FIELDS = list(dict.fromkeys(c["field"] for c in COURSES))
+COURSE_NAMES = [c["name"] for c in COURSES]
+
+# =====================================================
 # 2. 세션 상태
 # =====================================================
 defaults = {
@@ -171,6 +369,13 @@ defaults = {
     "detail_open": False,
     "guide_results": [],
     "guide_done": False,
+    # --- Supabase 연동용 ---
+    "visitor_token": None,       # 이 브라우저의 익명 방문자 비밀 토큰 (화면에 출력하지 않음)
+    "visitor_checked": False,
+    "cookie_pending": None,      # 브라우저 쿠키에 저장해야 할 토큰
+    "flash": None,               # 다음 화면 맨 위에 한 번 보여줄 안내
+    "review_nonce": 0,           # 후기 입력창을 비우기 위한 번호
+    "last_db_error": None,
 }
 for key, value in defaults.items():
     if key not in st.session_state:
@@ -181,6 +386,8 @@ def go_page(page):
     st.session_state.page = page
     st.session_state.detail_open = False
     st.session_state.selected_course = None
+    if page in ("🏠 홈", "⭐ 관심 과목"):
+        refresh_favorites(show_error=True)
     st.rerun()
 
 
@@ -192,20 +399,331 @@ def safe_key(text):
     return "".join(ch if ch.isalnum() else "_" for ch in text)
 
 
+def set_flash(kind, message):
+    st.session_state.flash = (kind, message)
+
+
+def show_flash():
+    flash = st.session_state.flash
+    if not flash:
+        return
+    st.session_state.flash = None
+    kind, message = flash
+    {"success": st.success, "warning": st.warning, "error": st.error}.get(kind, st.info)(message)
+
+
+def db_error_text(kind):
+    return DB_ERROR_MESSAGES.get(kind, DB_ERROR_MESSAGES["unknown"])
+
+
+# ---------- 익명 방문자 ----------
+def read_cookie_token():
+    """브라우저 쿠키에 저장된 방문자 토큰을 읽습니다. (Streamlit 1.37 이상)"""
+    try:
+        value = st.context.cookies.get(COOKIE_NAME)
+    except Exception:
+        return None
+    if value and TOKEN_PATTERN.match(value):
+        return value
+    return None
+
+
+def render_cookie_setter():
+    """새 방문자 토큰을 브라우저 쿠키에 저장합니다. (저장에 실패해도 현재 세션에서는 계속 사용 가능)"""
+    token = st.session_state.cookie_pending
+    if not token:
+        return
+    st.session_state.cookie_pending = None
+    max_age = COOKIE_DAYS * 24 * 60 * 60
+    components.html(
+        f"""
+        <script>
+        (function () {{
+          try {{
+            var secure = (window.parent.location.protocol === 'https:') ? '; Secure' : '';
+            window.parent.document.cookie = {json.dumps(COOKIE_NAME)} + '=' + {json.dumps(token)}
+              + '; path=/; max-age={max_age}; SameSite=Lax' + secure;
+          }} catch (e) {{}}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def init_visitor():
+    """세션 시작 시 한 번: 쿠키에 방문자 토큰이 있으면 서버에서 확인합니다."""
+    if st.session_state.visitor_checked:
+        return
+    st.session_state.visitor_checked = True
+    if not DB_READY:
+        return
+    token = read_cookie_token()
+    if not token:
+        return
+    ok, data = db_rpc("check_visitor", {"p_token": token})
+    if ok and data is True:
+        st.session_state.visitor_token = token
+        refresh_favorites()
+
+
+def ensure_visitor():
+    """방문자 토큰을 돌려줍니다. 처음이면 서버에 익명 방문자를 만듭니다. 실패하면 None."""
+    token = st.session_state.visitor_token
+    if token:
+        return token
+    if not DB_READY:
+        st.session_state.last_db_error = "offline"
+        return None
+    token = secrets.token_urlsafe(32)
+    ok, data = db_rpc("register_visitor", {"p_token": token})
+    if not ok:
+        st.session_state.last_db_error = data
+        return None
+    if not data:
+        st.session_state.last_db_error = "unknown"
+        return None
+    st.session_state.visitor_token = token
+    st.session_state.cookie_pending = token
+    return token
+
+
+def forget_visitor():
+    st.session_state.visitor_token = None
+    st.session_state.favorites = []
+
+
+# ---------- 관심 과목 ----------
+def refresh_favorites(show_error=False):
+    """현재 방문자의 관심 과목을 데이터베이스에서 다시 읽어옵니다."""
+    token = st.session_state.visitor_token
+    if not DB_READY or not token:
+        return False
+    ok, data = db_rpc("list_my_favorites", {"p_token": token})
+    if not ok:
+        if show_error:
+            set_flash("warning", "관심 과목을 불러오지 못했어요. " + db_error_text(data))
+        return False
+    ids = set()
+    for row in data or []:
+        ids.add(str(row["course_id"] if isinstance(row, dict) else row))
+    st.session_state.favorites = [c["name"] for c in COURSES if c.get("id") in ids]
+    return True
+
+
 def toggle_favorite(name):
+    course = find_course(name)
+    if not DB_READY or not course or not course.get("id"):
+        set_flash("warning", "지금은 관심 과목을 저장할 수 없어요. 데이터베이스 연결이 끝난 뒤에 다시 시도해 주세요.")
+        return
+
+    token = ensure_visitor()
+    if not token:
+        set_flash("warning", "방문자 정보를 만들지 못해 관심 과목을 저장하지 못했어요. "
+                  + db_error_text(st.session_state.last_db_error))
+        return
+
     favorites = list(st.session_state.favorites)
-    if name in favorites:
-        favorites.remove(name)
-        st.toast(f"⭐ {name} 과목을 관심 목록에서 뺐어요.")
-    else:
+    want_on = name not in favorites
+    ok, result = db_rpc("set_favorite", {
+        "p_token": token,
+        "p_course_id": course["id"],
+        "p_on": want_on,
+    })
+    if not ok:
+        set_flash("warning", "관심 과목을 저장하지 못했어요. " + db_error_text(result))
+        return
+    if result == "invalid_visitor":
+        forget_visitor()
+        set_flash("warning", "방문자 정보를 다시 확인해야 해요. 한 번 더 눌러 주세요.")
+        return
+    if result != "ok":
+        set_flash("warning", "관심 과목을 저장하지 못했어요. 잠시 후 다시 시도해 주세요.")
+        return
+
+    if want_on:
         favorites.append(name)
         st.toast(f"⭐ {name} 과목을 관심 목록에 담았어요.")
+    else:
+        favorites.remove(name)
+        st.toast(f"⭐ {name} 과목을 관심 목록에서 뺐어요.")
     st.session_state.favorites = favorites
 
 
 def open_detail(name):
     st.session_state.selected_course = name
     st.session_state.detail_open = True
+
+
+# ---------- 수강후기 ----------
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_reviews(_client, course_id, limit):
+    query = _client.table("public_reviews").select(
+        "id,course_id,course_name,rating,review_text,advice,created_at"
+    )
+    if course_id:
+        query = query.eq("course_id", course_id)
+    response = query.order("created_at", desc=True).limit(limit).execute()
+    return response.data or []
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_review_count(_client):
+    response = _client.table("public_reviews").select("id", count="exact").limit(1).execute()
+    return response.count or 0
+
+
+def clear_review_cache():
+    fetch_reviews.clear()
+    fetch_review_count.clear()
+
+
+def count_reviews():
+    if not DB_READY:
+        return None
+    try:
+        return fetch_review_count(SUPABASE)
+    except Exception as exc:
+        logger.warning("후기 개수 조회 실패: %s", type(exc).__name__)
+        return None
+
+
+_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|>~$<&:])")
+
+
+def plain_text(text):
+    """사용자가 쓴 글이 마크다운/링크/수식으로 해석되지 않도록 문자 그대로 보여줍니다."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = _MD_SPECIAL.sub(r"\\\1", text)
+    return text.replace("\n", "  \n")
+
+
+SENSITIVE_PATTERNS = [
+    (re.compile(r"01[016789][-.\s]?\d{3,4}[-.\s]?\d{4}"), "전화번호"),
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "이메일 주소"),
+    (re.compile(r"https?://|www\.", re.IGNORECASE), "인터넷 주소(링크)"),
+    (re.compile(r"\d{6}[-\s]?[1-4]\d{6}"), "주민등록번호 형태의 숫자"),
+]
+
+
+def find_sensitive(text):
+    for pattern, label in SENSITIVE_PATTERNS:
+        if pattern.search(text):
+            return label
+    return None
+
+
+REVIEW_RESULT_MESSAGES = {
+    "invalid_course": ("error", "선택한 과목을 찾지 못했어요. 새로고침한 뒤 다시 시도해 주세요."),
+    "invalid_input": ("warning", f"별점과 후기 내용을 확인해 주세요. (후기 {REVIEW_MAX:,}자, 조언 {ADVICE_MAX}자까지)"),
+    "rate_limited": ("warning", "짧은 시간에 후기를 너무 많이 등록했어요. 잠시 뒤에 다시 시도해 주세요."),
+    "duplicate": ("info", "같은 내용의 후기가 이미 등록되어 있어요."),
+}
+
+REPORT_REASONS = {
+    "spam": "광고·도배",
+    "abuse": "욕설·비방",
+    "privacy": "개인정보가 들어 있어요",
+    "misinformation": "잘못된 정보",
+    "other": "기타",
+}
+
+REPORT_RESULT_MESSAGES = {
+    "ok": ("success", "신고가 접수되었어요. 확인해 주셔서 고마워요."),
+    "duplicate": ("info", "이미 신고한 후기예요."),
+    "own_review": ("info", "내가 쓴 후기는 신고할 수 없어요."),
+    "invalid_review": ("warning", "이미 비공개로 바뀌었거나 찾을 수 없는 후기예요."),
+    "invalid_input": ("warning", "신고 내용을 확인해 주세요."),
+    "rate_limited": ("warning", "신고를 너무 많이 했어요. 잠시 뒤에 다시 시도해 주세요."),
+}
+
+
+def save_review(course_name, rating, text, advice):
+    course = find_course(course_name)
+    if not DB_READY or not course or not course.get("id"):
+        st.error("지금은 후기를 저장할 수 없어요. 데이터베이스 연결이 끝난 뒤에 다시 시도해 주세요.")
+        return
+
+    token = ensure_visitor()
+    if not token:
+        st.error("방문자 정보를 만들지 못해 후기를 저장하지 못했어요. "
+                 + db_error_text(st.session_state.last_db_error))
+        return
+
+    ok, result = db_rpc("submit_review", {
+        "p_token": token,
+        "p_course_id": course["id"],
+        "p_rating": int(rating),
+        "p_review_text": text,
+        "p_advice": advice,
+    })
+    if not ok:
+        st.error("후기 등록에 실패했어요. " + db_error_text(result))
+        return
+
+    if result == "published":
+        clear_review_cache()
+        st.session_state.review_nonce += 1
+        set_flash("success", "후기가 등록되었어요.")
+        st.rerun()
+    elif result == "pending":
+        clear_review_cache()
+        st.session_state.review_nonce += 1
+        set_flash("info", "후기가 접수되었어요. 개인정보나 링크가 들어 있는지 확인한 뒤에 공개돼요.")
+        st.rerun()
+    elif result == "invalid_visitor":
+        forget_visitor()
+        st.warning("방문자 정보를 다시 확인해야 해요. 후기 등록 버튼을 한 번 더 눌러 주세요.")
+    else:
+        kind, message = REVIEW_RESULT_MESSAGES.get(
+            result, ("error", "후기 등록에 실패했어요. 잠시 뒤에 다시 시도해 주세요.")
+        )
+        getattr(st, kind)(message)
+
+
+def submit_report(review_id, reason, detail):
+    token = ensure_visitor()
+    if not token:
+        st.warning("방문자 정보를 만들지 못해 신고하지 못했어요. "
+                   + db_error_text(st.session_state.last_db_error))
+        return
+    ok, result = db_rpc("report_review", {
+        "p_token": token,
+        "p_review_id": review_id,
+        "p_reason": reason,
+        "p_detail": detail or None,
+    })
+    if not ok:
+        st.error("신고를 접수하지 못했어요. " + db_error_text(result))
+        return
+    if result == "invalid_visitor":
+        forget_visitor()
+        st.warning("방문자 정보를 다시 확인해야 해요. 신고 버튼을 한 번 더 눌러 주세요.")
+        return
+    kind, message = REPORT_RESULT_MESSAGES.get(
+        result, ("error", "신고를 접수하지 못했어요. 잠시 뒤에 다시 시도해 주세요.")
+    )
+    if result == "ok":
+        clear_review_cache()
+    getattr(st, kind)(message)
+
+
+def render_report_box(review_id, key_prefix):
+    sid = safe_key(str(review_id))
+    with st.expander("🚩 이 후기 신고하기"):
+        reason = st.selectbox(
+            "신고 사유",
+            list(REPORT_REASONS.keys()),
+            format_func=lambda k: REPORT_REASONS[k],
+            key=f"{key_prefix}_rr_{sid}",
+        )
+        detail = st.text_input(
+            "추가 설명 (선택)",
+            max_chars=REPORT_DETAIL_MAX,
+            key=f"{key_prefix}_rd_{sid}",
+        )
+        if st.button("신고 접수하기", key=f"{key_prefix}_rb_{sid}", use_container_width=True):
+            submit_report(review_id, reason, detail.strip())
 
 
 # =====================================================
@@ -355,6 +873,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# 세션 시작 시 방문자 확인 (스타일 적용 후, 화면 그리기 전에 한 번)
+init_visitor()
+
 # =====================================================
 # 4. 사이드바
 # =====================================================
@@ -386,6 +907,9 @@ with st.sidebar:
     st.divider()
     st.markdown("### ⭐ 관심 과목")
     st.write(f"{len(st.session_state.favorites)}개 저장됨")
+    if not DB_READY:
+        st.caption("데이터베이스에 연결되기 전에는 저장할 수 없어요.")
+    render_cookie_setter()
 
 # =====================================================
 # 5. 공통 과목 카드
@@ -432,50 +956,78 @@ def render_course_card(course, prefix):
             st.rerun()
 
 
-def render_review_list(course_name=None):
-    reviews = st.session_state.reviews
+def render_review_list(course_name=None, key_prefix="reviews"):
+    if not DB_READY:
+        st.info("데이터베이스에 연결되면 다른 학생들의 수강후기를 볼 수 있어요.")
+        return
+
+    course_id = None
     if course_name:
-        reviews = [r for r in reviews if r["course"] == course_name]
+        course = find_course(course_name)
+        course_id = course.get("id") if course else None
+        if not course_id:
+            st.info("아직 등록된 후기가 없어요.")
+            return
+
+    try:
+        reviews = fetch_reviews(SUPABASE, course_id, REVIEW_LIST_LIMIT)
+    except Exception as exc:
+        kind = classify_db_error(exc)
+        logger.warning("후기 조회 실패: %s (kind=%s)", type(exc).__name__, kind)
+        st.warning("후기를 불러오지 못했어요. " + db_error_text(kind))
+        return
 
     if not reviews:
         st.info("아직 등록된 후기가 없어요.")
         return
 
-    for review in reversed(reviews):
+    for review in reviews:
         st.markdown('<div class="review-card">', unsafe_allow_html=True)
-        st.markdown(f"**📚 {html.escape(review['course'])} · ⭐ {review['rating']}/5**")
-        st.write(review["text"])
+        st.markdown(f"**📚 {html.escape(review['course_name'])} · ⭐ {review['rating']}/5**")
+        st.write(plain_text(review["review_text"]))
         if review.get("advice"):
-            st.caption("💡 조언: " + review["advice"])
+            st.caption("💡 조언: " + plain_text(review["advice"]))
+        render_report_box(review["id"], key_prefix)
         st.markdown("</div>", unsafe_allow_html=True)
+
+    if len(reviews) >= REVIEW_LIST_LIMIT:
+        st.caption(f"최근 후기 {REVIEW_LIST_LIMIT}개까지만 보여드려요.")
 
 
 def render_review_form(course_name, prefix):
-    with st.form(f"{prefix}_{safe_key(course_name)}"):
-        rating = st.slider("추천 정도", 1, 5, 4, key=f"{prefix}_rating_{safe_key(course_name)}")
+    st.markdown(
+        '<div class="notice">🔒 이름, 전화번호, 학교명, 연락처 같은 <b>개인정보는 적지 마세요.</b> '
+        '다른 사람을 비방하는 내용과 링크도 올릴 수 없어요.</div>',
+        unsafe_allow_html=True,
+    )
+    nonce = st.session_state.review_nonce
+    with st.form(f"{prefix}_{safe_key(course_name)}_{nonce}"):
+        rating = st.slider("추천 정도", 1, 5, 4, key=f"{prefix}_rating_{safe_key(course_name)}_{nonce}")
         review_text = st.text_area(
             "수강후기",
             placeholder="배운 내용, 느낀 점, 과목이 잘 맞을 학생 등을 적어 주세요.",
-            key=f"{prefix}_text_{safe_key(course_name)}",
+            max_chars=REVIEW_MAX,
+            key=f"{prefix}_text_{safe_key(course_name)}_{nonce}",
         )
         advice = st.text_input(
             "후배에게 주는 조언 (선택)",
-            key=f"{prefix}_advice_{safe_key(course_name)}",
+            max_chars=ADVICE_MAX,
+            key=f"{prefix}_advice_{safe_key(course_name)}_{nonce}",
         )
         submitted = st.form_submit_button("후기 등록하기", use_container_width=True)
 
     if submitted:
-        if not review_text.strip():
+        text = review_text.strip()
+        advice_text = advice.strip()
+        found = find_sensitive(text + " " + advice_text)
+        if not text:
             st.warning("후기 내용을 입력해 주세요.")
+        elif len(text) > REVIEW_MAX or len(advice_text) > ADVICE_MAX:
+            st.warning(f"글이 너무 길어요. 후기는 {REVIEW_MAX:,}자, 조언은 {ADVICE_MAX}자까지 쓸 수 있어요.")
+        elif found:
+            st.warning(f"{found}처럼 보이는 내용이 들어 있어요. 개인정보나 링크는 지우고 다시 등록해 주세요.")
         else:
-            st.session_state.reviews.append({
-                "course": course_name,
-                "rating": rating,
-                "text": review_text.strip(),
-                "advice": advice.strip(),
-            })
-            st.success("후기가 등록되었어요.")
-            st.rerun()
+            save_review(course_name, rating, text, advice_text)
 
 
 def render_detail_panel():
@@ -495,7 +1047,7 @@ def render_detail_panel():
     st.write(" · ".join(course["careers"]))
 
     st.markdown("### 💬 이 과목의 수강후기")
-    render_review_list(course["name"])
+    render_review_list(course["name"], "detail")
     render_review_form(course["name"], "detail_review")
 
     st.markdown("### 🔗 공식 자료 확인")
@@ -525,9 +1077,34 @@ def render_list_with_detail(courses, prefix):
             render_course_card(course, prefix)
 
 
+def render_db_status():
+    """데이터베이스를 쓸 수 없을 때, 사실 그대로 알려 줍니다. (연결된 것처럼 보이게 하지 않음)"""
+    if COURSE_STATUS == "ok":
+        return
+
+    if COURSE_STATUS == "offline":
+        detail = CONNECTION_MESSAGES.get(COURSE_STATUS_DETAIL, CONNECTION_MESSAGES["connect_failed"])
+    elif COURSE_STATUS == "error":
+        detail = db_error_text(COURSE_STATUS_DETAIL)
+    else:
+        detail = ("데이터베이스에 연결되었지만 활성화된 과목이 아직 없어요. "
+                  "courses 테이블에 과목 데이터를 등록했는지 확인해 주세요.")
+
+    st.warning(
+        "⚠️ 데이터베이스를 사용할 수 없어서 지금은 기본 과목 정보만 보여드려요. "
+        "관심 과목 저장과 수강후기는 연결이 끝난 뒤에 사용할 수 있어요."
+    )
+    with st.expander("관리자용 점검 안내"):
+        st.write(detail)
+        st.caption("자세한 해결 방법은 README.md의 '오류가 났을 때' 항목을 확인하세요.")
+
+
 # =====================================================
 # 6. 페이지
 # =====================================================
+show_flash()
+render_db_status()
+
 page = st.session_state.page
 
 if page == "🏠 홈":
@@ -542,10 +1119,12 @@ if page == "🏠 홈":
         unsafe_allow_html=True,
     )
 
+    review_count = count_reviews()
+
     a, b, c = st.columns(3)
     a.metric("등록 과목", f"{len(COURSES)}개")
     b.metric("관심 과목", f"{len(st.session_state.favorites)}개")
-    c.metric("수강후기", f"{len(st.session_state.reviews)}개")
+    c.metric("수강후기", f"{review_count}개" if review_count is not None else "-")
 
     st.markdown("## 어디서 시작할까요?")
     left, right = st.columns(2)
@@ -714,7 +1293,7 @@ elif page == "💬 수강후기":
     st.divider()
     st.markdown("## 🗣️ 등록된 후기")
     review_filter = st.selectbox("후기 필터", ["전체"] + COURSE_NAMES, key="review_filter")
-    render_review_list(None if review_filter == "전체" else review_filter)
+    render_review_list(None if review_filter == "전체" else review_filter, "allreviews")
 
     st.markdown(
         '<div class="notice">후기는 개인 경험에 따른 의견입니다. 수업 내용과 난이도는 학교마다 다를 수 있어요.</div>',
